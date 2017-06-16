@@ -55,6 +55,8 @@ class NRTSearcher(directory: Directory) {
 }
 
 object NRTSearcher {
+  case class SearchResult(documents: List[Document], totalHits: Int)
+
   def inFile(file: File) = new NRTSearcher(new NIOFSDirectory(file.toPath)) with Operations
   def inMem() = new NRTSearcher(new RAMDirectory()) with Operations
 
@@ -80,20 +82,11 @@ object NRTSearcher {
       token.set(trackingWriter.deleteDocuments(query))
     }
 
-    def search(query: Query, n: Int): TopDocs = {
+    def search(query: Query, n: Int): SearchResult = {
       indexSearcherReopenThread.waitForGeneration(token.get())
-      val s = indexSearcherReferenceManager.acquire()
+      implicit val s = indexSearcherReferenceManager.acquire()
       try {
-        s.search(query, n)
-      } finally {
-        indexSearcherReferenceManager.release(s)
-      }
-    }
-
-    def doc(docId: Int): Document = {
-      val s = indexSearcherReferenceManager.acquire()
-      try {
-        s.doc(docId)
+        s.search(query, n).toSearchResult
       } finally {
         indexSearcherReferenceManager.release(s)
       }
@@ -109,4 +102,16 @@ object NRTSearcher {
       }
     }
   }
+
+  implicit class TopDocsWrapper(topDocs: TopDocs) {
+    def toSearchResult(implicit indexSearcher: IndexSearcher): SearchResult = {
+      SearchResult(
+        Option(topDocs.scoreDocs).
+          toList.
+          flatMap(_.map(d => indexSearcher.doc(d.doc))),
+        topDocs.totalHits)
+    }
+  }
 }
+
+
