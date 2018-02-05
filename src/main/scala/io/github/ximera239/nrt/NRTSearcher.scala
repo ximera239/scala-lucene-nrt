@@ -5,7 +5,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import org.apache.lucene.analysis.standard.StandardAnalyzer
 import org.apache.lucene.document.Document
-import org.apache.lucene.index.{IndexWriter, IndexWriterConfig, Term, TrackingIndexWriter}
+import org.apache.lucene.index.{IndexWriter, IndexWriterConfig, Term}
 import org.apache.lucene.search._
 import org.apache.lucene.store.{Directory, NIOFSDirectory, RAMDirectory}
 
@@ -16,15 +16,14 @@ import scala.sys.ShutdownHookThread
   */
 class NRTSearcher(directory: Directory) {
   private val config = new IndexWriterConfig(new StandardAnalyzer()).setUseCompoundFile(true)
-  private val writer = new IndexWriter(directory, config)
-  protected val trackingWriter: TrackingIndexWriter = new TrackingIndexWriter(writer)
+  protected val writer = new IndexWriter(directory, config)
   protected val indexSearcherReferenceManager: SearcherManager =
     new SearcherManager(writer, true, true, null)
   protected val token: AtomicLong = new AtomicLong()
   private val isClosed = new AtomicBoolean(false)
 
   protected val indexSearcherReopenThread: ControlledRealTimeReopenThread[IndexSearcher] =
-    new ControlledRealTimeReopenThread(trackingWriter,
+    new ControlledRealTimeReopenThread(writer,
       indexSearcherReferenceManager,
       60.00,
       0.01)
@@ -39,7 +38,7 @@ class NRTSearcher(directory: Directory) {
   }
 
   def close(): Boolean = isClosed.synchronized {
-    if (!isClosed.get) {
+    if (!isClosed.getAndSet(true)) {
       indexSearcherReopenThread.interrupt()
       indexSearcherReopenThread.close()
 
@@ -55,36 +54,44 @@ class NRTSearcher(directory: Directory) {
 }
 
 object NRTSearcher {
-  case class SearchResult(documents: List[Document], totalHits: Int)
+  case class SearchResult(documents: List[Document], totalHits: Long)
 
   def inFile(file: File) = new NRTSearcher(new NIOFSDirectory(file.toPath)) with Operations
   def inMem() = new NRTSearcher(new RAMDirectory()) with Operations
 
+  type SearchType = (Query, Int) => SearchResult
+  type CountType = Query => Int
+
+  trait SearchOperations {
+    def search: SearchType
+    def count: CountType
+  }
+
   trait Operations {
     protected def token: AtomicLong
-    protected def trackingWriter: TrackingIndexWriter
+    protected def writer: IndexWriter
     protected def indexSearcherReopenThread: ControlledRealTimeReopenThread[IndexSearcher]
     protected def indexSearcherReferenceManager: SearcherManager
 
     def addDocument(d: Document): Unit = {
-      token.set(trackingWriter.addDocument(d))
+      token.set(writer.addDocument(d))
     }
 
     def updateDocument(term: Term, d: Document): Unit = {
-      token.set(trackingWriter.updateDocument(term, d))
+      token.set(writer.updateDocument(term, d))
     }
 
     def deleteDocuments(terms: Term*): Unit = {
-      token.set(trackingWriter.deleteDocuments(terms: _*))
+      token.set(writer.deleteDocuments(terms: _*))
     }
 
     def deleteDocuments(query: Query): Unit = {
-      token.set(trackingWriter.deleteDocuments(query))
+      token.set(writer.deleteDocuments(query))
     }
 
     def search(query: Query, n: Int): SearchResult = {
       indexSearcherReopenThread.waitForGeneration(token.get())
-      implicit val s = indexSearcherReferenceManager.acquire()
+      implicit val s: IndexSearcher = indexSearcherReferenceManager.acquire()
       try {
         s.search(query, n).toSearchResult
       } finally {
@@ -97,6 +104,19 @@ object NRTSearcher {
       val s = indexSearcherReferenceManager.acquire()
       try {
         s.count(query)
+      } finally {
+        indexSearcherReferenceManager.release(s)
+      }
+    }
+
+    def withStaticSearcher[T](f: (SearchOperations) => T): T = {
+      indexSearcherReopenThread.waitForGeneration(token.get())
+      implicit val s: IndexSearcher = indexSearcherReferenceManager.acquire()
+      try {
+        f(new SearchOperations {
+          override def search: SearchType = (q, i) => s.search(q, i).toSearchResult
+          override def count: CountType = (q) => s.count(q)
+        })
       } finally {
         indexSearcherReferenceManager.release(s)
       }
